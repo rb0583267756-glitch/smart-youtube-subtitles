@@ -1,9 +1,11 @@
 # כתוביות חכמות ליוטיוב
 
-הסקריפט מפעיל את הכתוביות של YouTube ובוחר תרגום לעברית כברירת מחדל. הוא תומך גם באנגלית ובצרפתית ובנגני YouTube מוטמעים. התרגום תלוי בזמינות כתוביות ואפשרויות תרגום בנגן.
+גרסת Tampermonkey של תוסף כתוביות חכמות, עם תמיכה ב־YouTube ובנגנים מוטמעים. שלושת הכפתורים בנגן פותחים את הגדרות הכתוביות, מפעילים הקראה בעברית או בוחרים טראק אודיו עברי כשהוא זמין בסרטון.
 
-## התקנה
+## התקנה ועדכון
 
 1. התקינו את [Tampermonkey](https://www.tampermonkey.net/).
-2. פתחו את [קישור ההתקנה](https://raw.githubusercontent.com/rb0583267756-glitch/smart-youtube-subtitles/main/smart-youtube-subtitles.user.js) ולחצו על Install בחלון של Tampermonkey.
-3. רעננו את דף הסרטון. לבחירת שפה או לשינוי מצב ההפעלה, פתחו את תפריט Tampermonkey בדף YouTube.
+2. פתחו את [קישור ההתקנה](https://raw.githubusercontent.com/rb0583267756-glitch/smart-youtube-subtitles/main/smart-youtube-subtitles.user.js) ולחצו על Install או Update.
+3. רעננו את דף הסרטון. אם תוסף Chrome של כתוביות חכמות פועל, כבו אותו כדי למנוע שתי שכבות כתוביות.
+
+לקול של Azure Speech, הזינו מפתח אישי דרך תפריט Tampermonkey בדף YouTube. אפשר להשתמש גם בקול שמציע הדפדפן.
