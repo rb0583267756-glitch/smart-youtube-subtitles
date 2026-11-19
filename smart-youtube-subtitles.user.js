@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         כתוביות חכמות ליוטיוב
 // @namespace    smart-youtube-subtitles
-// @version      1.2.1
+// @version      1.0.0
 // @description  כתוביות מותאמות, הקראה ואודיו עברי מתוך נגן YouTube
 // @match        https://*.youtube.com/*
 // @match        https://*.youtube-nocookie.com/*
 // @run-at       document-start
-// @sandbox      raw
+// @sandbox      DOM
+// @grant        GM_addElement
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
@@ -21,8 +22,7 @@
 'use strict';
 
 const runtime = {};
-let receiveConfig = () => {};
-let receivePlayer = () => {};
+const bridgeSource = "/* כתוביות חכמות — לוגיקה טהורה (ללא DOM) המשותפת לנגן, לתוכן ולבדיקות */\n(function (root) {\n  const C = {};\n  const safe = fn => { try { return fn(); } catch { return undefined; } };\n  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));\n\n  /* ---------- שפות ---------- */\n  C.normLang = l => String(l || '').trim().replace(/_/g, '-').replace(/^iw(?=$|[-.])/i, 'he').toLowerCase();\n  C.baseLang = l => C.normLang(l).split(/[-.]/)[0];\n  C.sameLang = (a, b) => !!a && !!b && C.baseLang(a) === C.baseLang(b);\n  C.isHebrew = l => C.baseLang(l) === 'he';\n\n  /* ---------- פענוח קובצי timedtext (json3 / srv3 / XML ישן) ---------- */\n  const decode = s => String(s)\n    .replace(/<[^>]+>/g, '')\n    .replace(/&#(\\d+);/g, (_, n) => String.fromCodePoint(+n))\n    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))\n    .replace(/&quot;/g, '\"').replace(/&#39;|&apos;/g, \"'\").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');\n\n  // 3.0.6: דף חסימה של גוגל (\"we can't process your request\") או כל HTML אחר — אינו כתוביות\n  C.isNotCaptions = body => { const t = String(body || '').trim(); return !!t && t[0] === '<' && !/<(timedtext|transcript)\\b/i.test(t.slice(0, 3000)); };\n  C.parseTimedText = function (body) {\n    const text = String(body || '').trim();\n    if (!text || C.isNotCaptions(text)) return [];\n    if (text[0] === '{') {\n      const json = safe(() => JSON.parse(text));\n      if (!json || !Array.isArray(json.events)) return [];\n      return json.events.filter(e => Array.isArray(e.segs)).map(e => ({\n        start: Number(e.tStartMs) || 0,\n        dur: Number(e.dDurationMs) || 0,\n        append: !!e.aAppend,\n        segs: e.segs.map(s => ({ text: String(s.utf8 || ''), off: s.tOffsetMs == null ? null : Number(s.tOffsetMs) || 0 }))\n      }));\n    }\n    const events = [];\n    // srv3: <p t=\"ms\" d=\"ms\"><s t=\"ms\">word</s></p>\n    const pRe = /<p\\b([^>]*)>([\\s\\S]*?)<\\/p>/g; let m;\n    while ((m = pRe.exec(text))) {\n      const attr = m[1], t = +(/\\bt=\"(\\d+)\"/.exec(attr) || [])[1] || 0, d = +(/\\bd=\"(\\d+)\"/.exec(attr) || [])[1] || 0;\n      const segs = []; const sRe = /<s\\b([^>]*)>([\\s\\S]*?)<\\/s>/g; let s;\n      while ((s = sRe.exec(m[2]))) segs.push({ text: decode(s[2]), off: /\\bt=\"(\\d+)\"/.test(s[1]) ? +/\\bt=\"(\\d+)\"/.exec(s[1])[1] : null });\n      if (!segs.length) segs.push({ text: decode(m[2].replace(/<br\\s*\\/?>/g, '\\n')), off: null });\n      events.push({ start: t, dur: d, append: /\\ba=\"1\"/.test(attr), segs });\n    }\n    if (events.length) return events;\n    // פורמט ישן: <text start=\"s\" dur=\"s\">\n    const tRe = /<text\\b([^>]*)>([\\s\\S]*?)<\\/text>/g;\n    while ((m = tRe.exec(text))) {\n      const st = parseFloat((/\\bstart=\"([\\d.]+)\"/.exec(m[1]) || [])[1]) || 0, du = parseFloat((/\\bdur=\"([\\d.]+)\"/.exec(m[1]) || [])[1]) || 0;\n      events.push({ start: Math.round(st * 1000), dur: Math.round(du * 1000), append: false, segs: [{ text: decode(decode(m[2])), off: null }] });\n    }\n    return events;\n  };\n\n  /* ---------- בניית קטעים (cues) ---------- */\n  const clean = s => s.replace(/[​﻿]/g, '').replace(/\\s*\\n+\\s*/g, ' ').replace(/\\s{2,}/g, ' ').trim();\n  C.buildCues = function (events, opts = {}) {\n    const content = events.filter(e => !e.append && clean(e.segs.map(s => s.text).join('')));\n    const asr = !!opts.asr || content.some(e => e.segs.some(s => s.off != null && s.off > 0));\n    const cues = [];\n    content.sort((a, b) => a.start - b.start);\n    for (let i = 0; i < content.length; i++) {\n      const e = content[i], next = content[i + 1];\n      let end = e.start + (e.dur || 4000);\n      if (asr && next && next.start > e.start) end = Math.min(end, next.start);\n      const text = clean(e.segs.map(s => s.text).join(''));\n      if (!text || end <= e.start) continue;\n      let words = null;\n      if (e.segs.some(s => s.off != null)) {\n        words = [];\n        for (const s of e.segs) {\n          const w = clean(s.text); if (!w) continue;\n          words.push({ t: e.start + (s.off || 0), text: w });\n        }\n      }\n      cues.push({ start: e.start, end, text, words, asr });\n    }\n    return cues;\n  };\n\n  /* חלוקת מילים לאורך זמן הקטע — לתצוגה חיה כשאין תזמון מילים (תרגום אוטומטי) */\n  C.interpolateWords = function (cue) {\n    if (cue.words && cue.words.length) return cue.words;\n    const parts = cue.text.split(/\\s+/).filter(Boolean);\n    const total = parts.reduce((n, w) => n + w.length + 1, 0) || 1;\n    const span = Math.min(cue.end - cue.start, Math.max(600, total * 75));\n    let acc = 0;\n    return parts.map(w => { const t = cue.start + span * acc / total; acc += w.length + 1; return { t, text: w }; });\n  };\n\n  /* חיפוש בינארי: האיבר האחרון שהתחיל עד at */\n  C.lastStarted = function (list, at) {\n    let lo = 0, hi = list.length - 1, ans = -1;\n    while (lo <= hi) { const mid = (lo + hi) >> 1; if (list[mid].start <= at) { ans = mid; lo = mid + 1; } else hi = mid - 1; }\n    return ans;\n  };\n\n  /* ---------- שבירת שורות דטרמיניסטית ---------- */\n  C.wrap = function (text, maxWidth, measure) {\n    const words = String(text || '').split(/\\s+/).filter(Boolean);\n    const lines = []; let line = '';\n    const pushLong = w => { // מילה ארוכה מרוחב השורה\n      let part = '';\n      for (const ch of w) { if (part && measure(part + ch) > maxWidth) { lines.push(part); part = ch; } else part += ch; }\n      return part;\n    };\n    for (const w of words) {\n      const cand = line ? line + ' ' + w : w;\n      if (measure(cand) <= maxWidth) { line = cand; continue; }\n      if (line) lines.push(line);\n      line = measure(w) > maxWidth ? pushLong(w) : w;\n    }\n    if (line) lines.push(line);\n    return lines;\n  };\n\n  /* ---------- מצב חי: מילה אחרי מילה ---------- */\n  C.liveText = function (cues, at, opts = {}) {\n    const hold = opts.hold ?? 2500, gap = opts.gap ?? 2000;\n    const i = C.lastStarted(cues, at);\n    if (i < 0) return '';\n    const cur = cues[i];\n    if (!cur.asr) { // 3.0.4: גם כתוביות ידניות / מתורגמות — מילה אחרי מילה לאורך הקטע (לא שורה שלמה בבת אחת)\n      const active = [];\n      for (let j = i; j >= 0 && j > i - 6; j--) if (cues[j].start <= at && at < cues[j].end) active.unshift(cues[j]);\n      return active.map(c => C.interpolateWords(c).filter(w => w.t <= at).map(w => w.text).join(' ')).filter(Boolean).join(' ');\n    }\n    if (at > cur.end + hold) return '';\n    let first = i;\n    while (first > 0 && i - first < 8 && cues[first].start - cues[first - 1].end < gap) first--;\n    const out = [];\n    for (let j = first; j <= i; j++) for (const w of C.interpolateWords(cues[j])) if (w.t <= at) out.push(w.text);\n    return out.join(' ');\n  };\n\n  /* ---------- 3.0.4 מעקב מילה אחר מילה: ציר זמן של כל המילים (מילה = אסימון בין רווחים) ---------- */\n  // 3.0.9: זמן לכל מילה בדיוק לפי המילים של טקסט הקטע (אותה ספירה כמו בעמודים) — פסיקים/סימנים שהגיעו\n  // כקטע נפרד כבר לא מזיזים את הספירה, ולכן ההדגשה וההופעה מילה-מילה לא \"בורחות\" לסוף.\n  C.cueTokenTimes = function (c) {\n    const toks = c.text.split(/\\s+/).filter(Boolean);\n    if (!toks.length) return [];\n    const span = Math.max(300, (c.end - c.start) * 0.92);\n    const byChars = () => { const total = toks.reduce((n, w) => n + w.length + 1, 0) || 1; let acc = 0; return toks.map(w => { const t = c.start + span * acc / total; acc += w.length + 1; return t; }); };\n    if (!c.words || !c.words.length) return byChars();\n    // מיקום כל מילה מתוזמנת בתוך הטקסט, ואז לכל אסימון — הזמן של המילה שמתחילה לפניו\n    const marks = []; let pos = 0;\n    for (const w of c.words) { const i = c.text.indexOf(w.text, pos); if (i < 0) continue; marks.push({ i, t: w.t }); pos = i + w.text.length; }\n    if (!marks.length) return byChars();\n    const out = []; let p = 0, m = 0;\n    for (const tok of toks) {\n      const i = c.text.indexOf(tok, p); p = i < 0 ? p : i + tok.length;\n      while (m + 1 < marks.length && marks[m + 1].i <= (i < 0 ? p : i)) m++;\n      out.push(Math.max(c.start, marks[m].t));\n    }\n    for (let k = 1; k < out.length; k++) if (out[k] < out[k - 1]) out[k] = out[k - 1];\n    return out;\n  };\n  C.wordTimeline = function (cues) {\n    const out = [];\n    for (const c of cues) for (const t of C.cueTokenTimes(c)) out.push({ t, end: c.end });\n    for (let k = 0; k < out.length - 1; k++) if (out[k + 1].t > out[k].t) out[k].end = Math.min(out[k].end, out[k + 1].t);\n    return out;\n  };\n\n  /* ---------- 3.0.9: הערות של יוטיוב כמו [מוזיקה] / (מחיאות כפיים) / ♪ — לא מוצגות ולא מוקראות ---------- */\n  const NOISE_RE = /\\[[^\\]]{0,60}\\]|\\([^)]{0,30}\\)|\\*[^*\\n]{1,30}\\*|[♪♫🎵🎶]+/g;\n  // סימני החלפת דובר של יוטיוב (\">>\", \"<<\", \"»\", \"-\") — לא טקסט שנאמר\n  const MARK_RE = /(^|\\s)(?:>{1,3}|<{1,3}|[»«›‹]+|[-–—]{1,2}(?=\\s))\\s*/g;\n  const denoise = t => String(t).replace(NOISE_RE, ' ').replace(MARK_RE, '$1').replace(/\\s{2,}/g, ' ').trim();\n  C.stripNoise = function (cues) {\n    const out = [];\n    for (const c of cues) {\n      const text = denoise(c.text);\n      if (!text || !/[\\p{L}\\p{N}]/u.test(text)) continue;\n      if (text === c.text) { out.push(c); continue; }\n      const words = c.words ? c.words.map(w => ({ ...w, text: denoise(w.text) })).filter(w => w.text && /[\\p{L}\\p{N}]/u.test(w.text)) : null;\n      out.push({ ...c, text, words: words && words.length ? words : null });\n    }\n    return out;\n  };\n\n  /* ---------- מצב שורות שלמות: עמודים יציבים ---------- */\n  const SENTENCE_END = /[.?!…׃:;\"”»)]$/;\n  C.buildPages = function (cues, opts) {\n    const { lines: maxLines, maxWidth, measure, joinAll } = opts;\n    const fits = t => C.wrap(t, maxWidth, measure).length <= maxLines;\n    const groups = [];\n    let g = null;\n    for (const c of cues) {\n      if ((c.asr || joinAll) && g) {\n        const last = g.cues[g.cues.length - 1];\n        const joined = g.text + ' ' + c.text;\n        // joinAll (מצב חי/מעקב): ממלאים עד N שורות גם אחרי סוף משפט, כל עוד אין שתיקה ארוכה\n        if (c.start - last.end < 1200 && (joinAll || !SENTENCE_END.test(g.text)) && fits(joined)) { g.cues.push(c); g.text = joined; g.end = c.end; continue; }\n      }\n      g = { start: c.start, end: c.end, text: c.text, cues: [c] };\n      groups.push(g);\n    }\n    const pages = [];\n    let wi = 0; // אינדקס המילה הראשונה בעמוד בציר הזמן של המילים\n    const count = ls => ls.join(' ').split(/\\s+/).filter(Boolean).length;\n    for (const grp of groups) {\n      const wrapped = C.wrap(grp.text, maxWidth, measure);\n      const groupWords = grp.text.split(/\\s+/).filter(Boolean).length;\n      if (wrapped.length <= maxLines) { pages.push({ start: grp.start, end: grp.end, lines: wrapped, wi }); wi += groupWords; continue; }\n      let gwi = wi; wi += groupWords;\n      // קטע ארוך: מחלקים לעמודים — שום מילה לא נחתכת, הזמן מתחלק לפי אורך הטקסט\n      const total = wrapped.join(' ').length || 1; let acc = 0;\n      for (let k = 0; k < wrapped.length; k += maxLines) {\n        const chunk = wrapped.slice(k, k + maxLines), len = chunk.join(' ').length + 1;\n        const s = grp.start + (grp.end - grp.start) * acc / total; acc += len;\n        pages.push({ start: Math.round(s), end: Math.round(grp.start + (grp.end - grp.start) * Math.min(1, acc / total)), lines: chunk, wi: gwi });\n        gwi += count(chunk);\n      }\n    }\n    pages.sort((a, b) => a.start - b.start);\n    for (let k = 0; k < pages.length - 1; k++) if (pages[k].end > pages[k + 1].start && pages[k].end - pages[k + 1].start < 400) pages[k].end = pages[k + 1].start;\n    return pages;\n  };\n  C.pageAt = function (pages, at) {\n    const i = C.lastStarted(pages, at);\n    return i >= 0 && at < pages[i].end ? pages[i] : null;\n  };\n\n  /* ---------- יחידות הקראה (TTS): משפטים ---------- */\n  C.speechUnits = function (cues) {\n    const units = []; let u = null;\n    for (const c of cues) {\n      if (u && c.start - u.end < 900 && !SENTENCE_END.test(u.text) && u.text.length + c.text.length < 220) { u.text += ' ' + c.text; u.end = c.end; continue; }\n      u = { start: c.start, end: c.end, text: c.text }; units.push(u);\n    }\n    return units;\n  };\n\n  /* ---------- בחירת מסלול כתוביות ---------- */\n  C.chooseCaptionTrack = function (tracks, translationLangs, target, audioLang) {\n    tracks = (tracks || []).filter(Boolean);\n    if (!tracks.length) return { reason: 'none' };\n    const manual = tracks.filter(t => t.kind !== 'asr');\n    const direct = manual.find(t => C.sameLang(t.languageCode, target)) || tracks.find(t => C.sameLang(t.languageCode, target));\n    if (direct) return { track: direct, translate: false };\n    const canTranslate = !translationLangs || !translationLangs.length || translationLangs.some(l => C.sameLang(l.languageCode, target));\n    const translatable = tracks.filter(t => t.isTranslatable !== false && t.is_translateable !== false);\n    const src = translatable.find(t => t.kind !== 'asr' && audioLang && C.sameLang(t.languageCode, audioLang))\n      || translatable.find(t => t.kind === 'asr') || translatable.find(t => t.kind !== 'asr') || null;\n    if (!src || !canTranslate) return { reason: 'no-translation' };\n    return { track: src, translate: true };\n  };\n\n  /* ---------- זיהוי שפת האודיו המקורי ---------- */\n  const ORIGINAL_RE = /original|מקורי|מקור|オリジナル|原始|оригинал|originale|original/i;\n  C.detectAudioLanguage = function ({ formats, captionTracks } = {}) {\n    const seen = new Map();\n    for (const f of formats || []) if (f && f.audioTrack && f.audioTrack.id && !seen.has(f.audioTrack.id)) seen.set(f.audioTrack.id, f.audioTrack);\n    const tracks = [...seen.values()];\n    if (tracks.length) {\n      const named = tracks.find(t => ORIGINAL_RE.test(t.displayName || ''));\n      if (named) return { lang: C.baseLang(named.id), confidence: 'high', source: 'audio-track', multi: tracks.length > 1 };\n      if (tracks.length === 1) return { lang: C.baseLang(tracks[0].id), confidence: 'high', source: 'audio-track', multi: false };\n    }\n    const asr = (captionTracks || []).find(t => t.kind === 'asr');\n    if (asr) return { lang: C.baseLang(asr.languageCode), confidence: 'high', source: 'asr', multi: tracks.length > 1 };\n    if (tracks.length) { const def = tracks.find(t => t.audioIsDefault); if (def) return { lang: C.baseLang(def.id), confidence: 'medium', source: 'default-track', multi: true }; }\n    const manual = (captionTracks || []).filter(t => t.kind !== 'asr');\n    if (manual.length && manual.every(t => C.isHebrew(t.languageCode))) return { lang: 'he', confidence: 'low', source: 'captions-only-hebrew', multi: false };\n    return { lang: '', confidence: 'unknown', source: 'none', multi: tracks.length > 1 };\n  };\n  C.shouldHideForHebrew = (detected, showHebrew) => !showHebrew && C.isHebrew(detected.lang) && (detected.confidence === 'high' || detected.confidence === 'medium');\n\n  /* ---------- אובייקטי ערוץ אודיו של נגן יוטיוב (שמות מאפיינים מוקטנים) ---------- */\n  const ID_RE = /^[a-z]{2,3}(-[A-Za-z0-9]+)*\\.\\d+$/;\n  const strings = obj => { const out = []; if (!obj || typeof obj !== 'object') return out; for (const k of Object.keys(obj)) { const v = safe(() => obj[k]); if (typeof v === 'string') out.push(v); } return out; };\n  C.audioTrackInfo = function (t) {\n    if (!t) return { id: '', lang: '', name: '', original: false };\n    const info = safe(() => t.getLanguageInfo && t.getLanguageInfo()) || t.languageInfo || null;\n    const ids = [t.id, t.audioTrackId, safe(() => t.getId && t.getId()), info && info.id, safe(() => info && info.getId && info.getId()), ...strings(t), ...strings(info)];\n    const id = ids.find(v => typeof v === 'string' && ID_RE.test(v)) || '';\n    const names = [t.displayName, t.name, info && info.name, safe(() => info && info.getName && info.getName()), ...strings(info), ...strings(t)].filter(v => typeof v === 'string' && v && !ID_RE.test(v) && /\\p{L}{2}/u.test(v));\n    const name = names.find(n => ORIGINAL_RE.test(n)) || names[0] || '';\n    const lang = id ? C.baseLang(id) : C.baseLang(t.languageCode || (info && info.languageCode) || '');\n    const original = ORIGINAL_RE.test(name) || t.isOriginal === true || !!(info && info.isOriginal === true);\n    return { id, lang, name, original };\n  };\n  C.pickMixTracks = function (tracks, formatsHint) {\n    const infos = (tracks || []).map(t => ({ t, ...C.audioTrackInfo(t) }));\n    const dub = infos.find(i => C.isHebrew(i.lang));\n    const hint = formatsHint ? C.detectAudioLanguage({ formats: formatsHint }) : null;\n    const original = infos.find(i => i.original && !C.isHebrew(i.lang))\n      || (hint && hint.lang && !C.isHebrew(hint.lang) ? infos.find(i => i.lang === hint.lang) : null)\n      || infos.find(i => !C.isHebrew(i.lang) && i.lang);\n    return { dub: dub || null, original: original || null };\n  };\n\n  // 3.0.3: הערוץ המקורי של הסרטון (גם אם הוא בעברית) — לפי השם \"מקורי/original\", ואם אין — לפי ערוץ ברירת המחדל בנתוני הסרטון. לא מנחשים.\n  C.pickOriginalTrack = function (tracks, formatsHint) {\n    const infos = (tracks || []).map(t => ({ t, ...C.audioTrackInfo(t) }));\n    if (infos.length < 2) return null;\n    const named = infos.find(i => i.original);\n    if (named) return named;\n    const seen = new Map();\n    for (const f of formatsHint || []) if (f && f.audioTrack && f.audioTrack.id && !seen.has(f.audioTrack.id)) seen.set(f.audioTrack.id, f.audioTrack);\n    const fmt = [...seen.values()];\n    const byName = fmt.find(a => ORIGINAL_RE.test(a.displayName || ''));\n    const def = byName || fmt.find(a => a.audioIsDefault);\n    return def ? (infos.find(i => i.id && i.id === def.id) || null) : null;\n  };\n\n  /* ---------- סנכרון נגן המקור ---------- */\n  C.syncDecision = function (drift, masterRate) {\n    const a = Math.abs(drift);\n    if (a > 0.45) return { seek: true, rate: masterRate };\n    if (a > 0.04) return { seek: false, rate: +(masterRate * (1 - clamp(drift * 0.6, -0.08, 0.08))).toFixed(4) };\n    return { seek: false, rate: masterRate };\n  };\n\n  /* ---------- כתובת timedtext ---------- */\n  C.timedTextInfo = function (url) {\n    const u = safe(() => new URL(url, 'https://www.youtube.com'));\n    if (!u || !/\\/api\\/timedtext/.test(u.pathname)) return null;\n    const p = u.searchParams;\n    return { v: p.get('v') || '', lang: p.get('lang') || '', tlang: p.get('tlang') || '', kind: p.get('kind') || '', effective: p.get('tlang') || p.get('lang') || '' };\n  };\n  C.retargetTimedText = function (url, sourceLang, target) {\n    const u = new URL(url, 'https://www.youtube.com');\n    if (C.sameLang(sourceLang || u.searchParams.get('lang'), target)) u.searchParams.delete('tlang'); else u.searchParams.set('tlang', target);\n    u.searchParams.set('fmt', 'json3');\n    return u.toString();\n  };\n\n  root.SmartCaptionsCore = C;\n  if (typeof module === 'object' && module.exports) module.exports = C;\n})(globalThis);\n\n/* כתוביות חכמות — גשר בעולם הדף (MAIN): גישה ל-API הפנימי של נגן יוטיוב,\n   לכידת קובצי הכתוביות שהנגן מוריד, אכיפת שפה וערבוב דיבוב עם קול המקור. */\n(() => {\n  if (window.__smartCaptionsBridge) return;\n  window.__smartCaptionsBridge = true;\n  const C = globalThis.SmartCaptionsCore;\n  const ORIGIN = location.origin;\n  const params = new URL(location.href).searchParams;\n  const COMPANION = params.has('smartcc_companion');\n  const safe = (fn, d) => { try { const v = fn(); return v === undefined ? d : v; } catch { return d; } };\n  const getPlayer = () => document.querySelector('#movie_player');\n  const post = (type, data) => window.postMessage({ source: 'smartcc-bridge', type, ...data }, ORIGIN);\n  const origFetch = window.fetch;\n\n  /* ======================= נגן מקור נסתר (companion) ======================= */\n  if (COMPANION) { companion(); return; }\n\n  let cfg = null;\n  let videoId = '';\n  const urls = new Map();       // videoId -> {url, info}\n  const cueCache = new Map();   // videoId|lang -> cues\n  const pending = new Set();\n  let delivered = '';\n  let lastLoadModule = 0, lastEnforce = 0, enforceTries = 0, moduleRequestedAt = 0, baseUrlTried = '';\n  let lastStateKey = '', blockedAt = 0;\n\n  /* ---------- לכידת timedtext ---------- */\n  function onTimedText(url, body) {\n    const info = C.timedTextInfo(url);\n    if (!info) return;\n    const v = info.v || videoId;\n    if (!v) return;\n    urls.set(v, { url, info });\n    if (!cfg) return;\n    if (C.sameLang(info.effective, cfg.language)) {\n      const events = C.parseTimedText(body);\n      if (events.length) store(v, cfg.language, C.buildCues(events, { asr: info.kind === 'asr' }), info);\n    } else fetchTarget(v);\n  }\n  function store(v, lang, cues, info) {\n    if (!cues.length) return;\n    cueCache.set(v + '|' + C.baseLang(lang), { cues, translated: !!(info && info.tlang && !C.sameLang(info.lang, lang)), from: info ? info.lang : '' });\n    if (v === videoId && C.sameLang(lang, cfg.language)) deliver();\n  }\n  function deliver(force) {\n    if (!cfg || !videoId) return;\n    const key = videoId + '|' + C.baseLang(cfg.language);\n    const entry = cueCache.get(key);\n    if (!entry || (!force && delivered === key)) return;\n    delivered = key;\n    post('cues', { videoId, lang: cfg.language, cues: entry.cues, translated: entry.translated, from: entry.from });\n  }\n  async function fetchTarget(v) {\n    if (!cfg) return;\n    const key = v + '|' + C.baseLang(cfg.language);\n    if (cueCache.has(key)) { if (v === videoId) deliver(); return; }\n    const src = urls.get(v);\n    if (!src || pending.has(key)) return;\n    pending.add(key);\n    try {\n      const url = C.retargetTimedText(src.url, src.info.lang, cfg.language);\n      const r = await origFetch.call(window, url, { credentials: 'include' });\n      const body = r.ok ? await r.text() : '';\n      if (!r.ok || C.isNotCaptions(body)) { blockedAt = Date.now(); lastStateKey = ''; }\n      const events = C.parseTimedText(body);\n      if (events.length) store(v, cfg.language, C.buildCues(events, { asr: src.info.kind === 'asr' }), C.timedTextInfo(url));\n    } catch { /* נשאר מצב גיבוי: קריאת הטקסט מהתצוגה של יוטיוב */ }\n    finally { setTimeout(() => pending.delete(key), 4000); }\n  }\n  async function fetchBaseUrl(v, track, translate) {\n    const id = v + '|' + track.baseUrl + '|' + cfg.language;\n    if (baseUrlTried === id) return;\n    baseUrlTried = id;\n    try {\n      const u = new URL(track.baseUrl, ORIGIN);\n      u.searchParams.set('fmt', 'json3');\n      if (translate) u.searchParams.set('tlang', cfg.language);\n      const r = await origFetch.call(window, u.toString(), { credentials: 'include' });\n      const txt = r.ok ? await r.text() : '';\n      if (!r.ok || C.isNotCaptions(txt)) { blockedAt = Date.now(); lastStateKey = ''; }\n      const events = C.parseTimedText(txt);\n      if (events.length) store(v, cfg.language, C.buildCues(events, { asr: track.kind === 'asr' }), C.timedTextInfo(u.toString()));\n    } catch { }\n  }\n\n  window.fetch = function (input, init) {\n    const p = origFetch.apply(this, arguments);\n    try {\n      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input && input.url;\n      if (url && url.includes('/api/timedtext')) p.then(r => r.clone().text()).then(t => onTimedText(url, t)).catch(() => {});\n    } catch { }\n    return p;\n  };\n  const xOpen = XMLHttpRequest.prototype.open, xSend = XMLHttpRequest.prototype.send;\n  XMLHttpRequest.prototype.open = function (method, url) { try { this.__smartccUrl = String(url); } catch { } return xOpen.apply(this, arguments); };\n  XMLHttpRequest.prototype.send = function () {\n    if (this.__smartccUrl && this.__smartccUrl.includes('/api/timedtext')) {\n      this.addEventListener('load', () => {\n        try {\n          const rt = this.responseType;\n          const body = !rt || rt === 'text' ? this.responseText : rt === 'json' ? JSON.stringify(this.response) : rt === 'arraybuffer' ? new TextDecoder().decode(this.response) : '';\n          onTimedText(this.responseURL || this.__smartccUrl, body);\n        } catch { }\n      });\n    }\n    return xSend.apply(this, arguments);\n  };\n\n  /* ---------- הודעות מסקריפט התוכן ---------- */\n  window.addEventListener('message', e => {\n    if (e.source !== window || e.origin !== ORIGIN || !e.data || e.data.source !== 'smartcc-content') return;\n    if (dead) return;\n    lastPing = Date.now();\n    // 3.0.1: התוסף כובה / הוסר / נטען מחדש — הקוד שכבר רץ בדף נעצר לגמרי ומחזיר את הנגן למצב שלפני\n    if (e.data.type === 'shutdown') { shutdown(); return; }\n    if (e.data.type === 'config') {\n      const prev = cfg; cfg = e.data.cfg;\n      if (!prev || !C.sameLang(prev.language, cfg.language)) { delivered = ''; enforceTries = 0; lastEnforce = 0; if (videoId) { deliver(); fetchTarget(videoId); } }\n      if (prev && (prev.enabled !== cfg.enabled || prev.tts !== cfg.tts)) { lastEnforce = 0; lastLoadModule = 0; }\n      if (prev && prev.dubVolume !== cfg.dubVolume && (mix.state === 'active' || mix.state === 'starting')) safe(() => getPlayer().setVolume(cfg.dubVolume));\n      if (prev && prev.hebrewDub && !cfg.hebrewDub) { stopMix(true); forceOrigUntil = Date.now() + 12000; lastOrigFix = 0; }\n      if (prev && !prev.hebrewDub && cfg.hebrewDub) mix.error = '';\n      lastStateKey = '';\n    }\n    if (e.data.type === 'need-cues') deliver(true);\n  });\n\n  /* ---------- ערבוב אודיו (3.0.1): הסרטון הראשי בדיבוב העברי + נגן מקביל נסתר שמנגן את הקול המקורי חלש מאחורה.\n     רק כשבסרטון יש באמת ערוץ אודיו בעברית. אם הנגן המקביל נכשל — נשארים בעברית (לעולם לא אנגלית לבד). ---------- */\n  let dead = false, lastPing = 0, visibleSince = document.visibilityState === 'visible' ? Date.now() : 0;\n  document.addEventListener('visibilitychange', () => { visibleSince = document.visibilityState === 'visible' ? Date.now() : 0; });\n  function shutdown() {\n    if (dead) return;\n    dead = true;\n    safe(() => stopMix(true));\n    safe(() => clearInterval(loop));\n    window.__smartCaptionsBridge = false;\n  }\n  const mix = { state: 'off', error: '', frame: null, saved: null, original: null, dub: null, startedAt: 0, waitingSince: 0, status: '', video: '', lastFix: 0, detail: '', kind: '' };\n  // 3.0.2: הנגן המקביל נפתח קודם כדף צפייה מלא (שם יוטיוב חושף את ערוצי האודיו), ואם נכשל — כנגן מוטמע.\n  const COMPANION_KINDS = ['watch', 'embed'];\n  function companionUrl(kind, t) {\n    const id = encodeURIComponent(videoId);\n    if (kind === 'watch') return `${ORIGIN}/watch?v=${id}&t=${t}s&smartcc_companion=1`;\n    return `${ORIGIN}/embed/${id}?autoplay=1&controls=0&disablekb=1&fs=0&iv_load_policy=3&playsinline=1&rel=0&enablejsapi=1&start=${t}&hl=he&smartcc_companion=1`;\n  }\n  function openCompanion(p, kind) {\n    if (mix.frame) { mix.frame.remove(); mix.frame = null; }\n    const t = Math.floor(safe(() => p.querySelector('video').currentTime, 0));\n    const f = document.createElement('iframe');\n    f.dataset.smartccCompanion = kind;\n    f.title = 'כתוביות חכמות · נגן קול מקורי ברקע';\n    f.allow = 'autoplay; encrypted-media';\n    f.setAttribute('aria-hidden', 'true'); f.tabIndex = -1;\n    f.style.cssText = 'position:absolute;left:0;bottom:0;width:240px;height:240px;border:0;opacity:0;pointer-events:none;z-index:-1';\n    f.src = companionUrl(kind, t);\n    p.prepend(f);\n    mix.frame = f; mix.kind = kind; mix.state = 'starting'; mix.startedAt = Date.now(); mix.detail = ''; mix.status = 'מפעיל את הקול המקורי ברקע…';\n  }\n  // כשל בנגן המקביל: קודם מנסים את הסוג הבא, ורק אז מוותרים (הראשי נשאר בעברית)\n  function companionFailed(msg) {\n    const next = COMPANION_KINDS[COMPANION_KINDS.indexOf(mix.kind) + 1];\n    const p = getPlayer();\n    if (next && p) { mix.lastFail = msg; openCompanion(p, next); return; }\n    failMix(msg);\n  }\n  function stopMix(restore) {\n    const p = getPlayer();\n    if (mix.frame) { mix.frame.remove(); mix.frame = null; }\n    if (mix.saved && p) {\n      if (restore && mix.video === videoId && mix.saved.changedTrack) safe(() => p.setAudioTrack(mix.saved.track));\n      safe(() => p.setVolume(mix.saved.volume));\n    }\n    detachVideo();\n    Object.assign(mix, { state: 'off', saved: null, original: null, dub: null, startedAt: 0, waitingSince: 0, status: '', detail: '', kind: '' });\n  }\n  function failMix(msg) { const d = mix.detail; stopMix(false); /* the main player stays on Hebrew */ mix.error = msg + (d ? ' (' + d + ')' : ''); mix.state = 'error'; }\n  let boundVideo = null;\n  const onVideoEvent = () => syncCompanion();\n  const VIDEO_EVENTS = ['play', 'pause', 'seeked', 'seeking', 'ratechange', 'waiting', 'playing', 'volumechange'];\n  function attachVideo(v) { if (boundVideo === v) return; detachVideo(); boundVideo = v; for (const ev of VIDEO_EVENTS) v.addEventListener(ev, onVideoEvent); }\n  function detachVideo() { if (!boundVideo) return; for (const ev of VIDEO_EVENTS) boundVideo.removeEventListener(ev, onVideoEvent); boundVideo = null; }\n  function syncCompanion() {\n    const p = getPlayer(), v = p && p.querySelector('video');\n    if (!mix.frame || !v || !mix.frame.contentWindow || !cfg) return;\n    const ad = p.classList.contains('ad-showing');\n    const muted = safe(() => p.isMuted(), false) || v.muted;\n    mix.frame.contentWindow.postMessage({\n      source: 'smartcc-master', type: 'sync', t: v.currentTime, paused: v.paused || ad || v.readyState < 3,\n      rate: v.playbackRate, volume: muted ? 0 : Math.max(0, Math.min(1, cfg.originalVolume / 100)),\n      track: mix.original.id, trackLang: mix.original.lang, videoId\n    }, ORIGIN);\n  }\n  // 3.0.3: כשהדיבוב כבוי (או שאין דיבוב עברי) — יוטיוב לא יחליף לבד לדיבוב אוטומטי (למשל אנגלית):\n  // בתחילת כל סרטון מחזירים לערוץ המקורי. אחרי 30 שניות לא נוגעים — אם המשתמש בחר ערוץ בעצמו, זו בחירתו.\n  let videoStartAt = 0, lastOrigFix = 0, forceOrigUntil = 0;\n  const audioLog = [];\n  function keepOriginal(p, response) {\n    // 3.0.10: אחרי כיבוי הדיבוב מחזירים לערוץ המקורי של הסרטון בכל שלב (לא רק ב-30 השניות הראשונות)\n    if (!(forceOrigUntil > Date.now()) && (!videoStartAt || Date.now() - videoStartAt > 30000)) return;\n    if (Date.now() - lastOrigFix < 1500) return;\n    if (p.classList.contains('ad-showing') || typeof p.setAudioTrack !== 'function') return;\n    const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);\n    const orig = C.pickOriginalTrack(tracks, safe(() => response.streamingData.adaptiveFormats, []));\n    if (!orig) return;\n    const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));\n    if (!cur.id || cur.id === orig.id) return;\n    lastOrigFix = Date.now();\n    audioLog.push(new Date().toISOString().slice(11, 19) + ' ' + cur.id + ' → ' + orig.id + ' (מקורי)'); if (audioLog.length > 10) audioLog.shift();\n    safe(() => p.setAudioTrack(orig.t));\n  }\n  function tickMix(p, response) {\n    if (!cfg || !cfg.hebrewDub) { if (mix.state !== 'off' && mix.state !== 'error') stopMix(true); mix.error = ''; keepOriginal(p, response); return; }\n    if (mix.state === 'error') { // דיבוב מופעל: אם יש ערוץ עברי — הראשי נשאר בעברית; רק בלי ערוץ עברי שומרים על המקורי\n      const hasHe = C.pickMixTracks(safe(() => Array.from(p.getAvailableAudioTracks() || []), []), null).dub;\n      if (!hasHe) keepOriginal(p, response);\n      return;\n    }\n    if (mix.state === 'off') {\n      const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);\n      const formats = safe(() => response.streamingData.adaptiveFormats, []);\n      const pick = C.pickMixTracks(tracks, formats);\n      if (!pick.dub || !pick.original) {\n        if (!mix.waitingSince) mix.waitingSince = Date.now();\n        mix.status = 'בודק ערוצי אודיו…';\n        if (Date.now() - mix.waitingSince > 8000) {\n          mix.error = !pick.dub ? 'בסרטון הזה אין ערוץ דיבוב בעברית. אפשר להפעיל \"הקראת הכתוביות בקול\" במקום.' : 'לא נמצא ערוץ אודיו מקורי נפרד בסרטון הזה.';\n          mix.state = 'error';\n        }\n        return;\n      }\n      if (p.classList.contains('ad-showing')) { mix.status = 'ממתין לסיום הפרסומת…'; return; }\n      const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));\n      mix.saved = { track: safe(() => p.getAudioTrack()), volume: safe(() => p.getVolume(), 100), changedTrack: false };\n      mix.dub = pick.dub; mix.original = pick.original; mix.video = videoId;\n      // הסרטון הראשי: הדיבוב בעברית, בעוצמת הדיבוב. הקול המקורי — בנגן המקביל, חלש מאחורה\n      if (cur.id !== pick.dub.id && typeof p.setAudioTrack === 'function') { safe(() => p.setAudioTrack(pick.dub.t)); mix.saved.changedTrack = true; }\n      safe(() => p.setVolume(cfg.dubVolume));\n      openCompanion(p, COMPANION_KINDS[0]);\n      attachVideo(p.querySelector('video'));\n      return;\n    }\n    const v = p.querySelector('video'); if (v) attachVideo(v);\n    if (mix.state === 'starting' && Date.now() - mix.startedAt > 20000) { companionFailed('הקול המקורי ברקע לא התחיל לנגן — נשאר הדיבוב בעברית בלבד.'); return; }\n    if (Date.now() - mix.lastFix > 3000) {\n      mix.lastFix = Date.now();\n      const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));\n      if (cur.id && !C.isHebrew(cur.lang)) safe(() => p.setAudioTrack(mix.dub.t)); // הראשי נשאר בעברית\n    }\n    syncCompanion();\n  }\n  window.addEventListener('message', e => {\n    if (!mix.frame || e.source !== mix.frame.contentWindow || e.origin !== ORIGIN || !e.data || e.data.source !== 'smartcc-companion') return;\n    if (e.data.type === 'ready' && mix.state === 'starting') { mix.state = 'active'; mix.status = ''; }\n    if (e.data.type === 'status') { mix.detail = e.data.text || ''; if (mix.state === 'starting') mix.status = 'מפעיל את הקול המקורי ברקע… ' + mix.detail; }\n    if (e.data.type === 'error' && mix.state === 'starting') companionFailed(e.data.text || 'נגן הקול המקורי נכשל.');\n    else if (e.data.type === 'error') failMix(e.data.text || 'נגן הקול המקורי נכשל.');\n  });\n\n  /* ---------- לולאת הנגן הראשית ---------- */\n  function tick() {\n    const p = getPlayer();\n    if (!p || !cfg || typeof p.getVideoData !== 'function') return;\n    const data = safe(() => p.getVideoData(), {}) || {};\n    const id = data.video_id || '';\n    if (!id) return;\n    if (id !== videoId) {\n      if (mix.state !== 'off') stopMix(false);\n      mix.error = '';\n      videoId = id; videoStartAt = Date.now(); lastOrigFix = 0; delivered = ''; enforceTries = 0; lastEnforce = 0; lastLoadModule = 0; moduleRequestedAt = 0;\n      post('video', { videoId: id });\n      deliver(); fetchTarget(id);\n    }\n    const response = safe(() => p.getPlayerResponse(), {}) || {};\n    const renderer = safe(() => response.captions.playerCaptionsTracklistRenderer, null);\n    const captionTracks = (renderer && renderer.captionTracks) || [];\n    const audio = C.detectAudioLanguage({ formats: safe(() => response.streamingData.adaptiveFormats, []), captionTracks });\n    const hideHebrew = C.shouldHideForHebrew(audio, cfg.showHebrew);\n    // 3.0.6: גם כשהכתוביות מוסתרות והדיבוב הקולי פועל — טוענים את הכתוביות (מוסתרות) כדי להקריא אותן\n    const want = (cfg.enabled || cfg.tts) && !hideHebrew;\n    const choice = C.chooseCaptionTrack(captionTracks, renderer && renderer.translationLanguages, cfg.language, audio.lang);\n    let ytLang = '';\n    let status;\n\n    if (!captionTracks.length) status = renderer ? 'לסרטון הזה אין כתוביות זמינות' : 'לסרטון הזה אין כתוביות זמינות';\n    else if (!choice.track) status = 'אין לסרטון הזה תרגום אוטומטי לשפה שנבחרה';\n    if (want && choice.track) {\n      let list = safe(() => p.getOption('captions', 'tracklist'), []) || [];\n      if (!list.length) list = safe(() => p.getOption('captions', 'tracklist', { includeAsr: true }), []) || [];\n      const curTrack = safe(() => p.getOption('captions', 'track'), null);\n      const moduleOn = list.length || (curTrack && curTrack.languageCode) || p.querySelector('.ytp-caption-segment');\n      // בנגן החדש הרשימה לפעמים ריקה גם כשהכתוביות פועלות — בונים אותה מנתוני הסרטון\n      if (!list.length && moduleOn) list = captionTracks.map(t => ({ languageCode: t.languageCode, kind: t.kind || '', vss_id: t.vssId, name: t.name && (t.name.simpleText || t.name.runs && t.name.runs.map(r => r.text).join('')), languageName: t.name && t.name.simpleText, is_translateable: t.isTranslatable }));\n      if (!list.length) {\n        if (Date.now() - lastLoadModule > 3000) { lastLoadModule = Date.now(); if (!moduleRequestedAt) moduleRequestedAt = Date.now(); safe(() => p.loadModule('captions')); }\n        status = 'טוען כתוביות…';\n      } else {\n        const cur = safe(() => p.getOption('captions', 'track'), {}) || {};\n        ytLang = (cur.translationLanguage && cur.translationLanguage.languageCode) || cur.languageCode || '';\n        if (!C.sameLang(ytLang, cfg.language) && Date.now() - lastEnforce > 1200 && enforceTries < 12) {\n          lastEnforce = Date.now(); enforceTries++;\n          const src = choice.track;\n          const m = list.find(t => t.languageCode === src.languageCode && (t.kind || '') === (src.kind || '')) || list.find(t => t.languageCode === src.languageCode) || list[0];\n          const langName = ((renderer.translationLanguages || []).find(l => C.sameLang(l.languageCode, cfg.language)) || {}).languageName;\n          const next = choice.translate ? { ...m, translationLanguage: { languageCode: cfg.language, languageName: (langName && langName.simpleText) || cfg.language } } : m;\n          safe(() => p.setOption('captions', 'track', next));\n        }\n        if (C.sameLang(ytLang, cfg.language)) enforceTries = 0;\n      }\n      if (!cueCache.has(videoId + '|' + C.baseLang(cfg.language)) && moduleRequestedAt && Date.now() - moduleRequestedAt > 1800 && !urls.has(videoId) && choice.track.baseUrl) fetchBaseUrl(videoId, choice.track, choice.translate);\n      if (!status) status = choice.translate ? 'תרגום אוטומטי של יוטיוב' : 'כתוביות מקוריות בשפה שנבחרה';\n    }\n    if (blockedAt && !cueCache.has(videoId + '|' + C.baseLang(cfg.language))) status = 'יוטיוב חסם לרגע את הורדת התרגום (יותר מדי בקשות מהרשת) — מוצגות הכתוביות שהנגן עצמו מציג';\n    if (!cfg.enabled) status = 'הכתוביות כבויות';\n    else if (hideHebrew) status = 'אודיו המקור בעברית · הכתוביות מוסתרות';\n\n    safe(() => tickMix(p, response));\n\n    const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);\n    const pick = C.pickMixTracks(tracks, safe(() => response.streamingData.adaptiveFormats, []));\n    const state = {\n      videoId, status, want, hideHebrew, hasCaptions: captionTracks.length > 0, canTranslate: !!choice.track,\n      audioLang: audio.lang, audioConfidence: audio.confidence, ytLang,\n      sourceLang: choice.track ? choice.track.languageCode : '', translate: !!choice.translate,\n      audio: { cur: C.audioTrackInfo(safe(() => p.getAudioTrack())).id, tracks: tracks.map(t => { const i = C.audioTrackInfo(t); return i.id + (i.original ? '*' : '') + ' ' + i.name; }), log: audioLog.slice() },\n      haveCues: cueCache.has(videoId + '|' + C.baseLang(cfg.language)),\n      cueCount: (cueCache.get(videoId + '|' + C.baseLang(cfg.language)) || { cues: [] }).cues.length,\n      delivered,\n      mix: { state: mix.state, error: mix.error, status: mix.status, hasDub: !!pick.dub, hasOriginal: !!pick.original }\n    };\n    const key = JSON.stringify(state);\n    if (key !== lastStateKey) { lastStateKey = key; post('state', { state }); }\n  }\n  let lastErr = '';\n  const loop = setInterval(() => { if (dead) return; if (cfg && visibleSince && Date.now() - visibleSince > 6000 && Date.now() - lastPing > 6000) { shutdown(); return; } try { tick(); } catch (e) { const m = String(e && e.stack || e).slice(0, 400); if (m !== lastErr) { lastErr = m; post('error', { where: 'bridge', msg: m }); } } }, 250);\n  window.addEventListener('pagehide', () => { if (!dead) stopMix(true); });\n\n  /* ======================= צד נגן המקור ======================= */\n  function companion() {\n    const parentWin = window.parent;\n    const send = (type, data) => parentWin.postMessage({ source: 'smartcc-companion', type, ...data }, ORIGIN);\n    // 3.0.2: שקט מוחלט עד שהערוץ המקורי נבחר — שלא יישמע לרגע דיבוב/שפה אחרת מהנגן הנסתר\n    let trackOk = false;\n    const hush = setInterval(() => { const v = document.querySelector('#movie_player video'); if (v && !trackOk) v.muted = true; }, 100);\n    let readySent = false, lastSeek = 0, lastTrackSet = 0, playRequestedAt = 0, prepared = false, firstSync = 0, lastSyncAt = 0;\n    // דיווח מצב מפורט לנגן הראשי — כדי שתמיד יהיה ברור למה הדיבוב לא מתחיל\n    setInterval(() => {\n      const p = getPlayer(), v = p && p.querySelector('video');\n      const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);\n      const info = [!p ? 'אין נגן' : 'נגן', !v ? 'אין וידאו' : (v.paused ? 'מושהה' : 'מנגן'), 'מצב ' + safe(() => p.getPlayerState(), '?'), 'ערוצים ' + tracks.length, 'נוכחי ' + (C.audioTrackInfo(safe(() => p.getAudioTrack())).id || '-'), lastSyncAt ? 'מסונכרן' : 'ללא סנכרון'].join(' · ');\n      send('status', { text: info });\n    }, 1500);\n    window.addEventListener('message', e => {\n      if (e.source !== parentWin || e.origin !== ORIGIN || !e.data || e.data.source !== 'smartcc-master' || e.data.type !== 'sync') return;\n      const d = e.data, p = getPlayer(), v = p && p.querySelector('video');\n      lastSyncAt = Date.now(); if (!firstSync) firstSync = Date.now();\n      if (!p || !v || typeof p.getVideoData !== 'function') return;\n      if (!prepared) {\n        prepared = true;\n        safe(() => p.unloadModule('captions'));\n        safe(() => p.setPlaybackQualityRange('tiny', 'tiny'));\n        safe(() => p.setPlaybackQuality('tiny'));\n        safe(() => p.addEventListener('onError', code => send('error', { text: (code === 101 || code === 150) ? 'בעל הסרטון חסם ניגון בהטמעה, לכן אי אפשר לנגן את הקול המקורי במקביל.' : 'נגן הקול המקורי נכשל (קוד שגיאה ' + code + ').' })));\n      }\n      const ad = p.classList.contains('ad-showing');\n      // ערוץ המקור\n      const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);\n      const want = tracks.map(t => ({ t, ...C.audioTrackInfo(t) })).find(i => i.id === d.track) || tracks.map(t => ({ t, ...C.audioTrackInfo(t) })).find(i => i.lang === d.trackLang);\n      const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));\n      if (want && cur.id !== want.id && Date.now() - lastTrackSet > 2000) { lastTrackSet = Date.now(); safe(() => p.setAudioTrack(want.t)); }\n      trackOk = !!(want && cur.id === want.id && !C.isHebrew(cur.lang));\n      if (!trackOk) { v.muted = true; }\n      else clearInterval(hush);\n      if (tracks.length && !want && Date.now() - firstSync > 8000) { send('error', { text: 'בנגן המקביל לא נמצא הערוץ המקורי.' }); return; }\n      if (!tracks.length && !v.paused && Date.now() - firstSync > 12000) { send('error', { text: 'הנגן המקביל לא חושף את ערוצי האודיו, ולכן אי אפשר לבחור בו את הקול המקורי.' }); return; }\n      // עוצמה — ישירות על רכיב הווידאו כדי לא לשנות את העוצמה השמורה של המשתמש ביוטיוב\n      if (ad) { v.muted = true; send('status', { text: 'פרסומת בנגן הדיבוב…' }); return; }\n      if (d.volume > 0 && safe(() => p.isMuted(), false)) safe(() => p.unMute());\n      v.muted = !trackOk || d.volume <= 0;\n      if (Math.abs(v.volume - d.volume) > 0.01) v.volume = d.volume;\n      // זמן, השהיה ומהירות\n      const drift = v.currentTime - d.t;\n      if (d.paused) {\n        if (!v.paused) safe(() => p.pauseVideo());\n        if (Math.abs(drift) > 0.25 && Date.now() - lastSeek > 600) { lastSeek = Date.now(); safe(() => p.seekTo(d.t, true)); }\n        v.playbackRate = d.rate;\n      } else {\n        if (v.paused) {\n          safe(() => p.playVideo());\n          if (!playRequestedAt) playRequestedAt = Date.now();\n          if (Date.now() - playRequestedAt > 6000) { send('error', { text: 'הדפדפן חסם ניגון אוטומטי של הקול המקורי. לחצו על הסרטון ואז הפעילו שוב את השילוב.' }); playRequestedAt = Date.now(); }\n        } else playRequestedAt = 0;\n        const dec = C.syncDecision(drift, d.rate);\n        if (dec.seek) { if (Date.now() - lastSeek > 1500) { lastSeek = Date.now(); safe(() => p.seekTo(d.t + 0.2 * d.rate, true)); } }\n        else if (Math.abs(v.playbackRate - dec.rate) > 0.001) v.playbackRate = dec.rate;\n      }\n      if (!readySent && trackOk && !v.paused && Math.abs(drift) < 1) { readySent = true; send('ready', {}); }\n    });\n  }\n})();\n";
 
 
 const storageKeys = ['settings', 'videoOv', "fontsAvail"];
@@ -650,406 +650,6 @@ async function synth(text, voiceOverride) {
   if (typeof module === 'object' && module.exports) module.exports = C;
 })(runtime);
 
-/* כתוביות חכמות — גשר בעולם הדף (MAIN): גישה ל-API הפנימי של נגן יוטיוב,
-   לכידת קובצי הכתוביות שהנגן מוריד, אכיפת שפה וערבוב דיבוב עם קול המקור. */
-(() => {
-  if (window.__smartCaptionsBridge) return;
-  window.__smartCaptionsBridge = true;
-  const C = runtime.SmartCaptionsCore;
-  const ORIGIN = location.origin;
-  const params = new URL(location.href).searchParams;
-  const COMPANION = params.has('smartcc_companion');
-  const safe = (fn, d) => { try { const v = fn(); return v === undefined ? d : v; } catch { return d; } };
-  const getPlayer = () => document.querySelector('#movie_player');
-  const post = (type, data) => queueMicrotask(() => receivePlayer({ type, ...data }));
-  const origFetch = window.fetch;
-
-  /* ======================= נגן מקור נסתר (companion) ======================= */
-  if (COMPANION) { companion(); return; }
-
-  let cfg = null;
-  let videoId = '';
-  const urls = new Map();       // videoId -> {url, info}
-  const cueCache = new Map();   // videoId|lang -> cues
-  const pending = new Set();
-  let delivered = '';
-  let lastLoadModule = 0, lastEnforce = 0, enforceTries = 0, moduleRequestedAt = 0, baseUrlTried = '';
-  let lastStateKey = '', blockedAt = 0;
-
-  /* ---------- לכידת timedtext ---------- */
-  function onTimedText(url, body) {
-    const info = C.timedTextInfo(url);
-    if (!info) return;
-    const v = info.v || videoId;
-    if (!v) return;
-    urls.set(v, { url, info });
-    if (!cfg) return;
-    if (C.sameLang(info.effective, cfg.language)) {
-      const events = C.parseTimedText(body);
-      if (events.length) store(v, cfg.language, C.buildCues(events, { asr: info.kind === 'asr' }), info);
-    } else fetchTarget(v);
-  }
-  function store(v, lang, cues, info) {
-    if (!cues.length) return;
-    cueCache.set(v + '|' + C.baseLang(lang), { cues, translated: !!(info && info.tlang && !C.sameLang(info.lang, lang)), from: info ? info.lang : '' });
-    if (v === videoId && C.sameLang(lang, cfg.language)) deliver();
-  }
-  function deliver(force) {
-    if (!cfg || !videoId) return;
-    const key = videoId + '|' + C.baseLang(cfg.language);
-    const entry = cueCache.get(key);
-    if (!entry || (!force && delivered === key)) return;
-    delivered = key;
-    post('cues', { videoId, lang: cfg.language, cues: entry.cues, translated: entry.translated, from: entry.from });
-  }
-  async function fetchTarget(v) {
-    if (!cfg) return;
-    const key = v + '|' + C.baseLang(cfg.language);
-    if (cueCache.has(key)) { if (v === videoId) deliver(); return; }
-    const src = urls.get(v);
-    if (!src || pending.has(key)) return;
-    pending.add(key);
-    try {
-      const url = C.retargetTimedText(src.url, src.info.lang, cfg.language);
-      const r = await origFetch.call(window, url, { credentials: 'include' });
-      const body = r.ok ? await r.text() : '';
-      if (!r.ok || C.isNotCaptions(body)) { blockedAt = Date.now(); lastStateKey = ''; }
-      const events = C.parseTimedText(body);
-      if (events.length) store(v, cfg.language, C.buildCues(events, { asr: src.info.kind === 'asr' }), C.timedTextInfo(url));
-    } catch { /* נשאר מצב גיבוי: קריאת הטקסט מהתצוגה של יוטיוב */ }
-    finally { setTimeout(() => pending.delete(key), 4000); }
-  }
-  async function fetchBaseUrl(v, track, translate) {
-    const id = v + '|' + track.baseUrl + '|' + cfg.language;
-    if (baseUrlTried === id) return;
-    baseUrlTried = id;
-    try {
-      const u = new URL(track.baseUrl, ORIGIN);
-      u.searchParams.set('fmt', 'json3');
-      if (translate) u.searchParams.set('tlang', cfg.language);
-      const r = await origFetch.call(window, u.toString(), { credentials: 'include' });
-      const txt = r.ok ? await r.text() : '';
-      if (!r.ok || C.isNotCaptions(txt)) { blockedAt = Date.now(); lastStateKey = ''; }
-      const events = C.parseTimedText(txt);
-      if (events.length) store(v, cfg.language, C.buildCues(events, { asr: track.kind === 'asr' }), C.timedTextInfo(u.toString()));
-    } catch { }
-  }
-
-  window.fetch = function (input, init) {
-    const p = origFetch.apply(this, arguments);
-    try {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input && input.url;
-      if (url && url.includes('/api/timedtext')) p.then(r => r.clone().text()).then(t => onTimedText(url, t)).catch(() => {});
-    } catch { }
-    return p;
-  };
-  const xOpen = XMLHttpRequest.prototype.open, xSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function (method, url) { try { this.__smartccUrl = String(url); } catch { } return xOpen.apply(this, arguments); };
-  XMLHttpRequest.prototype.send = function () {
-    if (this.__smartccUrl && this.__smartccUrl.includes('/api/timedtext')) {
-      this.addEventListener('load', () => {
-        try {
-          const rt = this.responseType;
-          const body = !rt || rt === 'text' ? this.responseText : rt === 'json' ? JSON.stringify(this.response) : rt === 'arraybuffer' ? new TextDecoder().decode(this.response) : '';
-          onTimedText(this.responseURL || this.__smartccUrl, body);
-        } catch { }
-      });
-    }
-    return xSend.apply(this, arguments);
-  };
-
-  /* ---------- הודעות מסקריפט התוכן ---------- */
-  receiveConfig = data => {
-    if (dead) return;
-    lastPing = Date.now();
-    // 3.0.1: התוסף כובה / הוסר / נטען מחדש — הקוד שכבר רץ בדף נעצר לגמרי ומחזיר את הנגן למצב שלפני
-    if (data.type === 'shutdown') { shutdown(); return; }
-    if (data.type === 'config') {
-      const prev = cfg; cfg = data.cfg;
-      if (!prev || !C.sameLang(prev.language, cfg.language)) { delivered = ''; enforceTries = 0; lastEnforce = 0; if (videoId) { deliver(); fetchTarget(videoId); } }
-      if (prev && (prev.enabled !== cfg.enabled || prev.tts !== cfg.tts)) { lastEnforce = 0; lastLoadModule = 0; }
-      if (prev && prev.dubVolume !== cfg.dubVolume && (mix.state === 'active' || mix.state === 'starting')) safe(() => getPlayer().setVolume(cfg.dubVolume));
-      if (prev && prev.hebrewDub && !cfg.hebrewDub) { stopMix(true); forceOrigUntil = Date.now() + 12000; lastOrigFix = 0; }
-      if (prev && !prev.hebrewDub && cfg.hebrewDub) mix.error = '';
-      lastStateKey = '';
-    }
-    if (data.type === 'need-cues') deliver(true);
-  };
-
-  /* ---------- ערבוב אודיו (3.0.1): הסרטון הראשי בדיבוב העברי + נגן מקביל נסתר שמנגן את הקול המקורי חלש מאחורה.
-     רק כשבסרטון יש באמת ערוץ אודיו בעברית. אם הנגן המקביל נכשל — נשארים בעברית (לעולם לא אנגלית לבד). ---------- */
-  let dead = false, lastPing = 0, visibleSince = document.visibilityState === 'visible' ? Date.now() : 0;
-  document.addEventListener('visibilitychange', () => { visibleSince = document.visibilityState === 'visible' ? Date.now() : 0; });
-  function shutdown() {
-    if (dead) return;
-    dead = true;
-    safe(() => stopMix(true));
-    safe(() => clearInterval(loop));
-    window.__smartCaptionsBridge = false;
-  }
-  const mix = { state: 'off', error: '', frame: null, saved: null, original: null, dub: null, startedAt: 0, waitingSince: 0, status: '', video: '', lastFix: 0, detail: '', kind: '' };
-  // 3.0.2: הנגן המקביל נפתח קודם כדף צפייה מלא (שם יוטיוב חושף את ערוצי האודיו), ואם נכשל — כנגן מוטמע.
-  const COMPANION_KINDS = ['watch', 'embed'];
-  function companionUrl(kind, t) {
-    const id = encodeURIComponent(videoId);
-    if (kind === 'watch') return `${ORIGIN}/watch?v=${id}&t=${t}s&smartcc_companion=1`;
-    return `${ORIGIN}/embed/${id}?autoplay=1&controls=0&disablekb=1&fs=0&iv_load_policy=3&playsinline=1&rel=0&enablejsapi=1&start=${t}&hl=he&smartcc_companion=1`;
-  }
-  function openCompanion(p, kind) {
-    if (mix.frame) { mix.frame.remove(); mix.frame = null; }
-    const t = Math.floor(safe(() => p.querySelector('video').currentTime, 0));
-    const f = document.createElement('iframe');
-    f.dataset.smartccCompanion = kind;
-    f.title = 'כתוביות חכמות · נגן קול מקורי ברקע';
-    f.allow = 'autoplay; encrypted-media';
-    f.setAttribute('aria-hidden', 'true'); f.tabIndex = -1;
-    f.style.cssText = 'position:absolute;left:0;bottom:0;width:240px;height:240px;border:0;opacity:0;pointer-events:none;z-index:-1';
-    f.src = companionUrl(kind, t);
-    p.prepend(f);
-    mix.frame = f; mix.kind = kind; mix.state = 'starting'; mix.startedAt = Date.now(); mix.detail = ''; mix.status = 'מפעיל את הקול המקורי ברקע…';
-  }
-  // כשל בנגן המקביל: קודם מנסים את הסוג הבא, ורק אז מוותרים (הראשי נשאר בעברית)
-  function companionFailed(msg) {
-    const next = COMPANION_KINDS[COMPANION_KINDS.indexOf(mix.kind) + 1];
-    const p = getPlayer();
-    if (next && p) { mix.lastFail = msg; openCompanion(p, next); return; }
-    failMix(msg);
-  }
-  function stopMix(restore) {
-    const p = getPlayer();
-    if (mix.frame) { mix.frame.remove(); mix.frame = null; }
-    if (mix.saved && p) {
-      if (restore && mix.video === videoId && mix.saved.changedTrack) safe(() => p.setAudioTrack(mix.saved.track));
-      safe(() => p.setVolume(mix.saved.volume));
-    }
-    detachVideo();
-    Object.assign(mix, { state: 'off', saved: null, original: null, dub: null, startedAt: 0, waitingSince: 0, status: '', detail: '', kind: '' });
-  }
-  function failMix(msg) { const d = mix.detail; stopMix(false); /* the main player stays on Hebrew */ mix.error = msg + (d ? ' (' + d + ')' : ''); mix.state = 'error'; }
-  let boundVideo = null;
-  const onVideoEvent = () => syncCompanion();
-  const VIDEO_EVENTS = ['play', 'pause', 'seeked', 'seeking', 'ratechange', 'waiting', 'playing', 'volumechange'];
-  function attachVideo(v) { if (boundVideo === v) return; detachVideo(); boundVideo = v; for (const ev of VIDEO_EVENTS) v.addEventListener(ev, onVideoEvent); }
-  function detachVideo() { if (!boundVideo) return; for (const ev of VIDEO_EVENTS) boundVideo.removeEventListener(ev, onVideoEvent); boundVideo = null; }
-  function syncCompanion() {
-    const p = getPlayer(), v = p && p.querySelector('video');
-    if (!mix.frame || !v || !mix.frame.contentWindow || !cfg) return;
-    const ad = p.classList.contains('ad-showing');
-    const muted = safe(() => p.isMuted(), false) || v.muted;
-    mix.frame.contentWindow.postMessage({
-      source: 'smartcc-master', type: 'sync', t: v.currentTime, paused: v.paused || ad || v.readyState < 3,
-      rate: v.playbackRate, volume: muted ? 0 : Math.max(0, Math.min(1, cfg.originalVolume / 100)),
-      track: mix.original.id, trackLang: mix.original.lang, videoId
-    }, ORIGIN);
-  }
-  // 3.0.3: כשהדיבוב כבוי (או שאין דיבוב עברי) — יוטיוב לא יחליף לבד לדיבוב אוטומטי (למשל אנגלית):
-  // בתחילת כל סרטון מחזירים לערוץ המקורי. אחרי 30 שניות לא נוגעים — אם המשתמש בחר ערוץ בעצמו, זו בחירתו.
-  let videoStartAt = 0, lastOrigFix = 0, forceOrigUntil = 0;
-  const audioLog = [];
-  function keepOriginal(p, response) {
-    // 3.0.10: אחרי כיבוי הדיבוב מחזירים לערוץ המקורי של הסרטון בכל שלב (לא רק ב-30 השניות הראשונות)
-    if (!(forceOrigUntil > Date.now()) && (!videoStartAt || Date.now() - videoStartAt > 30000)) return;
-    if (Date.now() - lastOrigFix < 1500) return;
-    if (p.classList.contains('ad-showing') || typeof p.setAudioTrack !== 'function') return;
-    const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);
-    const orig = C.pickOriginalTrack(tracks, safe(() => response.streamingData.adaptiveFormats, []));
-    if (!orig) return;
-    const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));
-    if (!cur.id || cur.id === orig.id) return;
-    lastOrigFix = Date.now();
-    audioLog.push(new Date().toISOString().slice(11, 19) + ' ' + cur.id + ' → ' + orig.id + ' (מקורי)'); if (audioLog.length > 10) audioLog.shift();
-    safe(() => p.setAudioTrack(orig.t));
-  }
-  function tickMix(p, response) {
-    if (!cfg || !cfg.hebrewDub) { if (mix.state !== 'off' && mix.state !== 'error') stopMix(true); mix.error = ''; keepOriginal(p, response); return; }
-    if (mix.state === 'error') { // דיבוב מופעל: אם יש ערוץ עברי — הראשי נשאר בעברית; רק בלי ערוץ עברי שומרים על המקורי
-      const hasHe = C.pickMixTracks(safe(() => Array.from(p.getAvailableAudioTracks() || []), []), null).dub;
-      if (!hasHe) keepOriginal(p, response);
-      return;
-    }
-    if (mix.state === 'off') {
-      const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);
-      const formats = safe(() => response.streamingData.adaptiveFormats, []);
-      const pick = C.pickMixTracks(tracks, formats);
-      if (!pick.dub || !pick.original) {
-        if (!mix.waitingSince) mix.waitingSince = Date.now();
-        mix.status = 'בודק ערוצי אודיו…';
-        if (Date.now() - mix.waitingSince > 8000) {
-          mix.error = !pick.dub ? 'בסרטון הזה אין ערוץ דיבוב בעברית. אפשר להפעיל "הקראת הכתוביות בקול" במקום.' : 'לא נמצא ערוץ אודיו מקורי נפרד בסרטון הזה.';
-          mix.state = 'error';
-        }
-        return;
-      }
-      if (p.classList.contains('ad-showing')) { mix.status = 'ממתין לסיום הפרסומת…'; return; }
-      const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));
-      mix.saved = { track: safe(() => p.getAudioTrack()), volume: safe(() => p.getVolume(), 100), changedTrack: false };
-      mix.dub = pick.dub; mix.original = pick.original; mix.video = videoId;
-      // הסרטון הראשי: הדיבוב בעברית, בעוצמת הדיבוב. הקול המקורי — בנגן המקביל, חלש מאחורה
-      if (cur.id !== pick.dub.id && typeof p.setAudioTrack === 'function') { safe(() => p.setAudioTrack(pick.dub.t)); mix.saved.changedTrack = true; }
-      safe(() => p.setVolume(cfg.dubVolume));
-      openCompanion(p, COMPANION_KINDS[0]);
-      attachVideo(p.querySelector('video'));
-      return;
-    }
-    const v = p.querySelector('video'); if (v) attachVideo(v);
-    if (mix.state === 'starting' && Date.now() - mix.startedAt > 20000) { companionFailed('הקול המקורי ברקע לא התחיל לנגן — נשאר הדיבוב בעברית בלבד.'); return; }
-    if (Date.now() - mix.lastFix > 3000) {
-      mix.lastFix = Date.now();
-      const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));
-      if (cur.id && !C.isHebrew(cur.lang)) safe(() => p.setAudioTrack(mix.dub.t)); // הראשי נשאר בעברית
-    }
-    syncCompanion();
-  }
-  window.addEventListener('message', e => {
-    if (!mix.frame || e.source !== mix.frame.contentWindow || e.origin !== ORIGIN || !e.data || e.data.source !== 'smartcc-companion') return;
-    if (e.data.type === 'ready' && mix.state === 'starting') { mix.state = 'active'; mix.status = ''; }
-    if (e.data.type === 'status') { mix.detail = e.data.text || ''; if (mix.state === 'starting') mix.status = 'מפעיל את הקול המקורי ברקע… ' + mix.detail; }
-    if (e.data.type === 'error' && mix.state === 'starting') companionFailed(e.data.text || 'נגן הקול המקורי נכשל.');
-    else if (e.data.type === 'error') failMix(e.data.text || 'נגן הקול המקורי נכשל.');
-  });
-
-  /* ---------- לולאת הנגן הראשית ---------- */
-  function tick() {
-    const p = getPlayer();
-    if (!p || !cfg || typeof p.getVideoData !== 'function') return;
-    const data = safe(() => p.getVideoData(), {}) || {};
-    const id = data.video_id || '';
-    if (!id) return;
-    if (id !== videoId) {
-      if (mix.state !== 'off') stopMix(false);
-      mix.error = '';
-      videoId = id; videoStartAt = Date.now(); lastOrigFix = 0; delivered = ''; enforceTries = 0; lastEnforce = 0; lastLoadModule = 0; moduleRequestedAt = 0;
-      post('video', { videoId: id });
-      deliver(); fetchTarget(id);
-    }
-    const response = safe(() => p.getPlayerResponse(), {}) || {};
-    const renderer = safe(() => response.captions.playerCaptionsTracklistRenderer, null);
-    const captionTracks = (renderer && renderer.captionTracks) || [];
-    const audio = C.detectAudioLanguage({ formats: safe(() => response.streamingData.adaptiveFormats, []), captionTracks });
-    const hideHebrew = C.shouldHideForHebrew(audio, cfg.showHebrew);
-    // 3.0.6: גם כשהכתוביות מוסתרות והדיבוב הקולי פועל — טוענים את הכתוביות (מוסתרות) כדי להקריא אותן
-    const want = (cfg.enabled || cfg.tts) && !hideHebrew;
-    const choice = C.chooseCaptionTrack(captionTracks, renderer && renderer.translationLanguages, cfg.language, audio.lang);
-    let ytLang = '';
-    let status;
-
-    if (!captionTracks.length) status = renderer ? 'לסרטון הזה אין כתוביות זמינות' : 'לסרטון הזה אין כתוביות זמינות';
-    else if (!choice.track) status = 'אין לסרטון הזה תרגום אוטומטי לשפה שנבחרה';
-    if (want && choice.track) {
-      let list = safe(() => p.getOption('captions', 'tracklist'), []) || [];
-      if (!list.length) list = safe(() => p.getOption('captions', 'tracklist', { includeAsr: true }), []) || [];
-      const curTrack = safe(() => p.getOption('captions', 'track'), null);
-      const moduleOn = list.length || (curTrack && curTrack.languageCode) || p.querySelector('.ytp-caption-segment');
-      // בנגן החדש הרשימה לפעמים ריקה גם כשהכתוביות פועלות — בונים אותה מנתוני הסרטון
-      if (!list.length && moduleOn) list = captionTracks.map(t => ({ languageCode: t.languageCode, kind: t.kind || '', vss_id: t.vssId, name: t.name && (t.name.simpleText || t.name.runs && t.name.runs.map(r => r.text).join('')), languageName: t.name && t.name.simpleText, is_translateable: t.isTranslatable }));
-      if (!list.length) {
-        if (Date.now() - lastLoadModule > 3000) { lastLoadModule = Date.now(); if (!moduleRequestedAt) moduleRequestedAt = Date.now(); safe(() => p.loadModule('captions')); }
-        status = 'טוען כתוביות…';
-      } else {
-        const cur = safe(() => p.getOption('captions', 'track'), {}) || {};
-        ytLang = (cur.translationLanguage && cur.translationLanguage.languageCode) || cur.languageCode || '';
-        if (!C.sameLang(ytLang, cfg.language) && Date.now() - lastEnforce > 1200 && enforceTries < 12) {
-          lastEnforce = Date.now(); enforceTries++;
-          const src = choice.track;
-          const m = list.find(t => t.languageCode === src.languageCode && (t.kind || '') === (src.kind || '')) || list.find(t => t.languageCode === src.languageCode) || list[0];
-          const langName = ((renderer.translationLanguages || []).find(l => C.sameLang(l.languageCode, cfg.language)) || {}).languageName;
-          const next = choice.translate ? { ...m, translationLanguage: { languageCode: cfg.language, languageName: (langName && langName.simpleText) || cfg.language } } : m;
-          safe(() => p.setOption('captions', 'track', next));
-        }
-        if (C.sameLang(ytLang, cfg.language)) enforceTries = 0;
-      }
-      if (!cueCache.has(videoId + '|' + C.baseLang(cfg.language)) && moduleRequestedAt && Date.now() - moduleRequestedAt > 1800 && !urls.has(videoId) && choice.track.baseUrl) fetchBaseUrl(videoId, choice.track, choice.translate);
-      if (!status) status = choice.translate ? 'תרגום אוטומטי של יוטיוב' : 'כתוביות מקוריות בשפה שנבחרה';
-    }
-    if (blockedAt && !cueCache.has(videoId + '|' + C.baseLang(cfg.language))) status = 'יוטיוב חסם לרגע את הורדת התרגום (יותר מדי בקשות מהרשת) — מוצגות הכתוביות שהנגן עצמו מציג';
-    if (!cfg.enabled) status = 'הכתוביות כבויות';
-    else if (hideHebrew) status = 'אודיו המקור בעברית · הכתוביות מוסתרות';
-
-    safe(() => tickMix(p, response));
-
-    const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);
-    const pick = C.pickMixTracks(tracks, safe(() => response.streamingData.adaptiveFormats, []));
-    const state = {
-      videoId, status, want, hideHebrew, hasCaptions: captionTracks.length > 0, canTranslate: !!choice.track,
-      audioLang: audio.lang, audioConfidence: audio.confidence, ytLang,
-      sourceLang: choice.track ? choice.track.languageCode : '', translate: !!choice.translate,
-      audio: { cur: C.audioTrackInfo(safe(() => p.getAudioTrack())).id, tracks: tracks.map(t => { const i = C.audioTrackInfo(t); return i.id + (i.original ? '*' : '') + ' ' + i.name; }), log: audioLog.slice() },
-      haveCues: cueCache.has(videoId + '|' + C.baseLang(cfg.language)),
-      cueCount: (cueCache.get(videoId + '|' + C.baseLang(cfg.language)) || { cues: [] }).cues.length,
-      delivered,
-      mix: { state: mix.state, error: mix.error, status: mix.status, hasDub: !!pick.dub, hasOriginal: !!pick.original }
-    };
-    const key = JSON.stringify(state);
-    if (key !== lastStateKey) { lastStateKey = key; post('state', { state }); }
-  }
-  let lastErr = '';
-  const loop = setInterval(() => { if (dead) return; if (cfg && visibleSince && Date.now() - visibleSince > 6000 && Date.now() - lastPing > 6000) { shutdown(); return; } try { tick(); } catch (e) { const m = String(e && e.stack || e).slice(0, 400); if (m !== lastErr) { lastErr = m; post('error', { where: 'bridge', msg: m }); } } }, 250);
-  window.addEventListener('pagehide', () => { if (!dead) stopMix(true); });
-
-  /* ======================= צד נגן המקור ======================= */
-  function companion() {
-    const parentWin = window.parent;
-    const send = (type, data) => parentWin.postMessage({ source: 'smartcc-companion', type, ...data }, ORIGIN);
-    // 3.0.2: שקט מוחלט עד שהערוץ המקורי נבחר — שלא יישמע לרגע דיבוב/שפה אחרת מהנגן הנסתר
-    let trackOk = false;
-    const hush = setInterval(() => { const v = document.querySelector('#movie_player video'); if (v && !trackOk) v.muted = true; }, 100);
-    let readySent = false, lastSeek = 0, lastTrackSet = 0, playRequestedAt = 0, prepared = false, firstSync = 0, lastSyncAt = 0;
-    // דיווח מצב מפורט לנגן הראשי — כדי שתמיד יהיה ברור למה הדיבוב לא מתחיל
-    setInterval(() => {
-      const p = getPlayer(), v = p && p.querySelector('video');
-      const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);
-      const info = [!p ? 'אין נגן' : 'נגן', !v ? 'אין וידאו' : (v.paused ? 'מושהה' : 'מנגן'), 'מצב ' + safe(() => p.getPlayerState(), '?'), 'ערוצים ' + tracks.length, 'נוכחי ' + (C.audioTrackInfo(safe(() => p.getAudioTrack())).id || '-'), lastSyncAt ? 'מסונכרן' : 'ללא סנכרון'].join(' · ');
-      send('status', { text: info });
-    }, 1500);
-    window.addEventListener('message', e => {
-      if (e.source !== parentWin || e.origin !== ORIGIN || !e.data || e.data.source !== 'smartcc-master' || e.data.type !== 'sync') return;
-      const d = e.data, p = getPlayer(), v = p && p.querySelector('video');
-      lastSyncAt = Date.now(); if (!firstSync) firstSync = Date.now();
-      if (!p || !v || typeof p.getVideoData !== 'function') return;
-      if (!prepared) {
-        prepared = true;
-        safe(() => p.unloadModule('captions'));
-        safe(() => p.setPlaybackQualityRange('tiny', 'tiny'));
-        safe(() => p.setPlaybackQuality('tiny'));
-        safe(() => p.addEventListener('onError', code => send('error', { text: (code === 101 || code === 150) ? 'בעל הסרטון חסם ניגון בהטמעה, לכן אי אפשר לנגן את הקול המקורי במקביל.' : 'נגן הקול המקורי נכשל (קוד שגיאה ' + code + ').' })));
-      }
-      const ad = p.classList.contains('ad-showing');
-      // ערוץ המקור
-      const tracks = safe(() => Array.from(p.getAvailableAudioTracks() || []), []);
-      const want = tracks.map(t => ({ t, ...C.audioTrackInfo(t) })).find(i => i.id === d.track) || tracks.map(t => ({ t, ...C.audioTrackInfo(t) })).find(i => i.lang === d.trackLang);
-      const cur = C.audioTrackInfo(safe(() => p.getAudioTrack()));
-      if (want && cur.id !== want.id && Date.now() - lastTrackSet > 2000) { lastTrackSet = Date.now(); safe(() => p.setAudioTrack(want.t)); }
-      trackOk = !!(want && cur.id === want.id && !C.isHebrew(cur.lang));
-      if (!trackOk) { v.muted = true; }
-      else clearInterval(hush);
-      if (tracks.length && !want && Date.now() - firstSync > 8000) { send('error', { text: 'בנגן המקביל לא נמצא הערוץ המקורי.' }); return; }
-      if (!tracks.length && !v.paused && Date.now() - firstSync > 12000) { send('error', { text: 'הנגן המקביל לא חושף את ערוצי האודיו, ולכן אי אפשר לבחור בו את הקול המקורי.' }); return; }
-      // עוצמה — ישירות על רכיב הווידאו כדי לא לשנות את העוצמה השמורה של המשתמש ביוטיוב
-      if (ad) { v.muted = true; send('status', { text: 'פרסומת בנגן הדיבוב…' }); return; }
-      if (d.volume > 0 && safe(() => p.isMuted(), false)) safe(() => p.unMute());
-      v.muted = !trackOk || d.volume <= 0;
-      if (Math.abs(v.volume - d.volume) > 0.01) v.volume = d.volume;
-      // זמן, השהיה ומהירות
-      const drift = v.currentTime - d.t;
-      if (d.paused) {
-        if (!v.paused) safe(() => p.pauseVideo());
-        if (Math.abs(drift) > 0.25 && Date.now() - lastSeek > 600) { lastSeek = Date.now(); safe(() => p.seekTo(d.t, true)); }
-        v.playbackRate = d.rate;
-      } else {
-        if (v.paused) {
-          safe(() => p.playVideo());
-          if (!playRequestedAt) playRequestedAt = Date.now();
-          if (Date.now() - playRequestedAt > 6000) { send('error', { text: 'הדפדפן חסם ניגון אוטומטי של הקול המקורי. לחצו על הסרטון ואז הפעילו שוב את השילוב.' }); playRequestedAt = Date.now(); }
-        } else playRequestedAt = 0;
-        const dec = C.syncDecision(drift, d.rate);
-        if (dec.seek) { if (Date.now() - lastSeek > 1500) { lastSeek = Date.now(); safe(() => p.seekTo(d.t + 0.2 * d.rate, true)); } }
-        else if (Math.abs(v.playbackRate - dec.rate) > 0.001) v.playbackRate = dec.rate;
-      }
-      if (!readySent && trackOk && !v.paused && Math.abs(drift) < 1) { readySent = true; send('ready', {}); }
-    });
-  }
-})();
-
 function startContent() {
 /* כתוביות חכמות — סקריפט תוכן: שכבת הכתוביות, גרירה, תפריט בתוך הנגן, CC והקראה */
 (() => {
@@ -1090,7 +690,7 @@ function startContent() {
   (document.head || document.documentElement).append(globalStyle);
 
   /* ---------- הגדרות ---------- */
-  const send = (type, extra) => queueMicrotask(() => receiveConfig({ type, ...extra }));
+  const send = (type, extra) => window.postMessage({ source: 'smartcc-content', type, ...extra }, ORIGIN);
   // 3.0.10: דיבוב קולי וטראק אודיו עברי — אפשר לכבות/להדליק לכל סרטון בנפרד (כפתורים על הנגן). ברירת מחדל: ההגדרה הכללית.
   let videoOv = {};
   const currentVideoId = () => {
@@ -1110,6 +710,7 @@ function startContent() {
     sendConfig(); refreshButtons(); refreshPanel();
     if (!ttsOn()) stopSpeech();
   }
+  const nativeFallback = new WeakSet();
   let lastCfgVideo = '';
   function apply(next) {
     const prev = settings;
@@ -1132,7 +733,15 @@ function startContent() {
   safe(() => chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.videoOv) { videoOv = c.videoOv.newValue || {}; sendConfig(); refreshButtons(); } }));
   safe(() => chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.settings && JSON.stringify(S.normalize(c.settings.newValue)) !== JSON.stringify(settings)) apply(c.settings.newValue); }));
   setInterval(() => {
-    if (loaded && !gotState) sendConfig();
+    if (loaded && !gotState) {
+      sendConfig();
+      // אם הגשר עדיין לא הגיב, מפעילים את הכתוביות דרך פקד YouTube.
+      const native = player?.querySelector(CC_SEL) || player?.parentElement?.querySelector(CC_SEL);
+      if (settings.enabled && native?.getAttribute('aria-pressed') === 'false' && !nativeFallback.has(native)) {
+        nativeFallback.add(native);
+        native.click();
+      }
+    }
     // משיכה: אם הגשר כבר מחזיק כתוביות ואנחנו עדיין לא — מבקשים שוב
     if (gotState && state.haveCues && !(cues.length && cueVideo === state.videoId)) send('need-cues', {});
     // 3.0.1: דופק לגשר שבדף. כשהתוסף כבוי / הוסר — אומרים לו להיעצר ולהחזיר את הנגן (אחרת הוא ממשיך לרוץ בלשונית)
@@ -1140,7 +749,9 @@ function startContent() {
   }, 1000);
 
   /* ---------- הודעות מהגשר ---------- */
-  receivePlayer = d => {
+  window.addEventListener('message', e => {
+    if (e.origin !== ORIGIN || (e.source && e.source !== window) || e.data?.source !== 'smartcc-bridge') return;
+    const d = e.data;
     if (d.type === 'error') errors.push(d.where + ': ' + d.msg);
     if (d.type === 'state') { gotState = true; state = d.state || {}; if (state.videoId !== lastCfgVideo) { lastCfgVideo = state.videoId; sendConfig(); } if (state.videoId && cueVideo && state.videoId !== cueVideo) resetCues(); paint(); refreshPanel(true); updateMenuItem(); refreshButtons(); }
     if (d.type === 'video') { resetCues(); }
@@ -1150,7 +761,7 @@ function startContent() {
       rawCues = d.cues; cues = settings.skipNoise ? C.stripNoise(d.cues) : d.cues; cueVideo = d.videoId; cueMeta = { translated: d.translated, from: d.from }; pageKey = ''; units = C.speechUnits(cues); ttsIndex = -2;
       refreshPanel(true);
     }
-  };
+  });
   function resetCues() { cues = []; cueMeta = null; cueVideo = ''; pages = []; pageKey = ''; units = []; lastLines = []; stopSpeech(); if (linesEl) linesEl.textContent = ''; }
 
   /* ---------- שכבת הכתוביות ---------- */
@@ -1805,12 +1416,12 @@ function startContent() {
   // כפתור CC והמקש C שולטים בכתוביות החכמות (ולא מחזירים את יוטיוב לאנגלית)
   window.addEventListener('click', e => {
     const t = e.target instanceof Element ? e.target.closest(CC_SEL) : null;
-    if (!t || !inPlayerArea(t)) return;
+    if (!gotState || !t || !inPlayerArea(t)) return;
     e.preventDefault(); e.stopImmediatePropagation();
     toggleEnabled();
   }, true);
   window.addEventListener('keydown', e => {
-    if (e.code !== 'KeyC' || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || !player) return;
+    if (e.code !== 'KeyC' || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || !player || !gotState) return;
     const t = e.composedPath()[0];
     if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return;
     e.preventDefault(); e.stopImmediatePropagation();
@@ -2024,6 +1635,26 @@ function startContent() {
 })();
 
 }
-if (document.documentElement) startContent();
-else document.addEventListener("DOMContentLoaded", startContent, { once: true });
+function start() {
+  // הפקדים עובדים בעולם המבודד גם אם הזרקת הגשר לעמוד נכשלה.
+  startContent();
+  try {
+    const script = GM_addElement(document.head || document.documentElement, 'script', {
+      type: 'text/javascript',
+      textContent: bridgeSource
+    });
+    script?.remove();
+  } catch (error) {
+    console.warn('Smart Captions: YouTube bridge could not be loaded', error);
+  }
+}
+if (document.documentElement) start();
+else {
+  const observer = new MutationObserver(() => {
+    if (!document.documentElement) return;
+    observer.disconnect();
+    start();
+  });
+  observer.observe(document, { childList: true });
+}
 })();
